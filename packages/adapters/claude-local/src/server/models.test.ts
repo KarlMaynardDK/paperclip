@@ -207,6 +207,79 @@ describe("claude_local model catalog override", () => {
 
       expect(resolveClaudeReasoningEfforts("claude-haiku-4-5")).toEqual(["low", "medium", "high", "xhigh"]);
     });
+
+    it("prefers an exact catalog-id match over a release-only match from an earlier alias", async () => {
+      const file = await makeOverrideFile(JSON.stringify({
+        version: 1,
+        direct: [
+          { id: "claude-sonnet-5-5", label: "Alias", efforts: ["low", "medium", "high"] },
+          { id: "claude-sonnet-5-5-20260301", label: "Pinned", efforts: ["low", "medium", "high", "xhigh", "max"] },
+        ],
+        bedrock: [],
+      }));
+      dirsToClean.push(path.dirname(file));
+      process.env.PAPERCLIP_CLAUDE_MODEL_CATALOG_FILE = file;
+
+      expect(resolveClaudeReasoningEfforts("claude-sonnet-5-5-20260301")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    });
+
+    it("falls back to the picker's bundled-catalog lookup for a Bedrock id whose catalog entry omits efforts", () => {
+      const resolved = resolveClaudeReasoningEfforts("us.anthropic.claude-opus-5-5");
+      expect(resolved).toEqual(claudeLocalReasoningEffortsForModel("us.anthropic.claude-opus-5-5"));
+      expect(resolved).toContain("xhigh");
+    });
+  });
+
+  it("merges the current catalog on every call, even within the live-discovery cache window", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    const file = await makeOverrideFile(JSON.stringify({
+      version: 1,
+      direct: [{ id: "claude-operator-model", label: "Operator Model", efforts: ["low", "medium", "high"] }],
+      bedrock: [],
+    }));
+    dirsToClean.push(path.dirname(file));
+    process.env.PAPERCLIP_CLAUDE_MODEL_CATALOG_FILE = file;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: "claude-operator-model", display_name: "Live Operator Label" }] }),
+    } as Response);
+
+    const first = await listClaudeModels();
+    expect(first).toContainEqual({
+      id: "claude-operator-model",
+      label: "Live Operator Label",
+      efforts: ["low", "medium", "high"],
+    });
+
+    await fs.writeFile(file, JSON.stringify({
+      version: 1,
+      direct: [{ id: "claude-operator-model", label: "Operator Model", efforts: ["low", "medium", "high", "xhigh"] }],
+      bedrock: [],
+    }), "utf8");
+    const bumped = new Date(Date.now() + 5000);
+    await fs.utimes(file, bumped, bumped);
+
+    // Same mocked fetch (no forceRefresh): the live-discovery cache is still fresh, but
+    // the catalog it's merged with must still reflect the on-disk edit immediately.
+    const second = await listClaudeModels();
+    expect(second).toContainEqual({
+      id: "claude-operator-model",
+      label: "Live Operator Label",
+      efforts: ["low", "medium", "high", "xhigh"],
+    });
+  });
+
+  it("doesn't re-read or re-warn about an unchanged invalid override on repeated lookups", async () => {
+    const file = await makeOverrideFile("{not json");
+    dirsToClean.push(path.dirname(file));
+    process.env.PAPERCLIP_CLAUDE_MODEL_CATALOG_FILE = file;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await listClaudeModels();
+    await listClaudeModels();
+    await listClaudeModels();
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
   it("refreshClaudeModels re-reads the override file on demand", async () => {
